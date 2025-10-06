@@ -253,3 +253,5 @@ CREATE TABLE daily_report (
   occupancy_pct DECIMAL(6,2) NOT NULL,
   PRIMARY KEY (day, scenario)
 );
+
+

@@ -1,12 +1,13 @@
 /**
- * Simulador "El reo comelón" — v3
+ * Simulador "El reo comelón" — v3.1
  * Selección aleatoria de platillos y compras con vencimiento aleatorio
- * 
+ * Guarda reportes diarios con la MISMA estructura que /status
+ *
  * Endpoints:
  *  GET /start?escenario=cap&tick=5000
  *  GET /status
  *  GET /stop
- *  GET /reportes
+ *  GET /reportes            (todos los días, mismos campos que /status)
  */
 
 const express = require('express');
@@ -27,11 +28,10 @@ let SIM = {
 };
 
 const randInt = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
-
 async function pool() { return mysql.createPool(DB); }
 async function q(conn, sql, params = []) { const [rows] = await conn.execute(sql, params); return rows; }
 
-// ---------- FUNCIONES DE BODEGA ----------
+// ---------- BODEGA ----------
 async function getWarehouseOccupancy(conn) {
   const rows = await q(conn, `
     SELECT i.id, i.name, i.unit_volume, COALESCE(SUM(l.qty),0) AS qty
@@ -48,7 +48,7 @@ async function getCapacity(conn, scenario) {
   return Number(row.capacity_m3);
 }
 
-// ---------- FUNCIONES PRINCIPALES ----------
+// ---------- DATOS FIJOS ----------
 async function loadStatic(conn) {
   const dishes = await q(conn, `SELECT * FROM dishes`);
   const ingredients = await q(conn, `SELECT * FROM ingredients`);
@@ -62,6 +62,7 @@ async function loadStatic(conn) {
   return { dishes, ingredients, recipesByDishClass: byDishClass };
 }
 
+// ---------- CONSUMOS ----------
 async function consumeIngredient(conn, ingredientId, qtyNeeded) {
   const lots = await q(conn, `
     SELECT * FROM inventory_lots
@@ -74,7 +75,7 @@ async function consumeIngredient(conn, ingredientId, qtyNeeded) {
     if (take > 0) {
       await q(conn, `UPDATE inventory_lots SET qty=qty-? WHERE id=?`, [take, lot.id]);
       taken += take;
-      need -= take;
+      need  -= take;
     }
   }
   return { taken, missing: Math.max(0, need) };
@@ -104,6 +105,7 @@ async function consumeDish(conn, dish, data, reos_std, reos_plus) {
   return faltantes;
 }
 
+// ---------- COMPRAS (inmediatas, por faltantes del día) ----------
 async function makePurchases(conn, faltantes, escenario, ingredients) {
   if (!faltantes.length) return [];
 
@@ -113,14 +115,17 @@ async function makePurchases(conn, faltantes, escenario, ingredients) {
 
   const compras = [];
   for (const f of faltantes) {
-    if (compras.find(x => x.id_insumo === f.id_insumo)) continue; // evitar duplicados
+    // evitar duplicados en la MISMA compra del día
+    if (compras.find(x => x.id_insumo === f.id_insumo)) continue;
+
     const ing = ingredients.find(x => x.id === f.id_insumo);
     const volUnit = Number(ing.unit_volume);
     const volNeed = volUnit * f.cantidad;
     if (volNeed > espacioLibre) continue; // no hay espacio
 
-    // generar días de vida aleatorio (solo perecederos)
+    // días de vida aleatorio solo para perecederos
     const diasVida = ing.perishable ? randInt(1, 30) : null;
+
     await q(conn, `INSERT INTO inventory_lots (ingredient_id, qty, days_remaining, created_day)
                    VALUES (?,?,?,?)`, [ing.id, f.cantidad, diasVida, SIM.dia]);
 
@@ -136,6 +141,7 @@ async function makePurchases(conn, faltantes, escenario, ingredients) {
   return compras;
 }
 
+// ---------- VENCIMIENTOS ----------
 async function ageAndPurge(conn, ingredients) {
   const rows = await q(conn, `SELECT id, ingredient_id, qty, days_remaining FROM inventory_lots WHERE days_remaining IS NOT NULL`);
   const mermas = [];
@@ -160,41 +166,41 @@ async function ageAndPurge(conn, ingredients) {
 // ---------- SIMULACIÓN DIARIA ----------
 async function simulateDay(conn) {
   SIM.dia += 1;
-  const { dishes, ingredients } = await loadStatic(conn);
+
+  const data = await loadStatic(conn);
+  const { dishes, ingredients, recipesByDishClass } = data;
 
   const reos_total = randInt(175, 180);
-  const reos_plus = Math.round(reos_total * 0.2);
-  const reos_std = reos_total - reos_plus;
+  const reos_plus  = Math.round(reos_total * 0.20);
+  const reos_std   = reos_total - reos_plus;
 
-  // Elegir menú aleatorio
-  const desayuno = dishes.filter(d => d.time_id === 1);
-  const almuerzo = dishes.filter(d => d.time_id === 2);
-  const cena = dishes.filter(d => d.time_id === 3);
+  // Menú aleatorio (1 por tiempo)
+  const desayunoList = dishes.filter(d => d.time_id === 1);
+  const almuerzoList = dishes.filter(d => d.time_id === 2);
+  const cenaList     = dishes.filter(d => d.time_id === 3);
 
   const menu = {
-    desayuno: desayuno[randInt(0, desayuno.length - 1)],
-    almuerzo: almuerzo[randInt(0, almuerzo.length - 1)],
-    cena: cena[randInt(0, cena.length - 1)]
+    desayuno: desayunoList[randInt(0, desayunoList.length - 1)],
+    almuerzo: almuerzoList[randInt(0, almuerzoList.length - 1)],
+    cena:     cenaList[randInt(0, cenaList.length - 1)]
   };
 
-  // Intentar cocinar cada platillo
+  // Consumir (faltantes se comprarán si hay espacio)
   let faltantesTotales = [];
-  faltantesTotales = faltantesTotales.concat(await consumeDish(conn, menu.desayuno, { recipesByDishClass: (await loadStatic(conn)).recipesByDishClass, ingredients }, reos_std, reos_plus));
-  faltantesTotales = faltantesTotales.concat(await consumeDish(conn, menu.almuerzo, { recipesByDishClass: (await loadStatic(conn)).recipesByDishClass, ingredients }, reos_std, reos_plus));
-  faltantesTotales = faltantesTotales.concat(await consumeDish(conn, menu.cena, { recipesByDishClass: (await loadStatic(conn)).recipesByDishClass, ingredients }, reos_std, reos_plus));
+  faltantesTotales = faltantesTotales.concat(await consumeDish(conn, menu.desayuno, { recipesByDishClass, ingredients }, reos_std, reos_plus));
+  faltantesTotales = faltantesTotales.concat(await consumeDish(conn, menu.almuerzo, { recipesByDishClass, ingredients }, reos_std, reos_plus));
+  faltantesTotales = faltantesTotales.concat(await consumeDish(conn, menu.cena,     { recipesByDishClass, ingredients }, reos_std, reos_plus));
 
-  // Compras si hay faltantes y espacio
   const compras = await makePurchases(conn, faltantesTotales, SIM.escenario, ingredients);
+  const mermas  = await ageAndPurge(conn, ingredients);
 
-  // Envejecer y eliminar vencidos
-  const mermas = await ageAndPurge(conn, ingredients);
-
-  // Ocupación
+  // Ocupación/Capacidad
   const { totalVol } = await getWarehouseOccupancy(conn);
-  const cap = await getCapacity(conn, SIM.escenario);
-  const occPct = ((totalVol / cap) * 100).toFixed(2);
+  const cap   = await getCapacity(conn, SIM.escenario);
+  const occPct = Number(((totalVol / cap) * 100).toFixed(2));
 
-  SIM.ultimoEstado = {
+  // Armar estado del día (estructura igual a /status)
+  const estadoDia = {
     dia: SIM.dia,
     escenario: SIM.escenario,
     reos_total,
@@ -202,30 +208,64 @@ async function simulateDay(conn) {
     menu: {
       desayuno: { id_platillo: menu.desayuno.id, nombre: menu.desayuno.name },
       almuerzo: { id_platillo: menu.almuerzo.id, nombre: menu.almuerzo.name },
-      cena: { id_platillo: menu.cena.id, nombre: menu.cena.name }
+      cena:     { id_platillo: menu.cena.id,     nombre: menu.cena.name }
     },
-    compras,
-    mermas,
-    ocupacion_pct: Number(occPct),
+    compras,                 // compras hechas hoy (por faltantes)
+    mermas,                  // descartados por vencimiento
+    ocupacion_pct: occPct,   // %
     capacidad_m3: cap,
     ocupado_m3: Number(totalVol.toFixed(4)),
     libre_m3: Number((cap - totalVol).toFixed(4))
   };
+
+  // Persistir en daily_report con "misma info" empaquetada en JSONs
+  // - menu_json       => menu
+  // - purchases_json  => { compras, capacidad_m3, ocupado_m3, libre_m3 }
+  // - waste_json      => mermas
+  await q(conn, `
+    INSERT INTO daily_report
+      (day, scenario, inmates_total, inmates_plus, menu_json, purchases_json, waste_json, occupancy_pct)
+    VALUES (?,?,?,?,?,?,?,?)
+    ON DUPLICATE KEY UPDATE
+      inmates_total = VALUES(inmates_total),
+      inmates_plus  = VALUES(inmates_plus),
+      menu_json     = VALUES(menu_json),
+      purchases_json= VALUES(purchases_json),
+      waste_json    = VALUES(waste_json),
+      occupancy_pct = VALUES(occupancy_pct)
+  `, [
+    estadoDia.dia,
+    estadoDia.escenario,
+    estadoDia.reos_total,
+    estadoDia.reos_plus,
+    JSON.stringify(estadoDia.menu),
+    JSON.stringify({
+      compras: estadoDia.compras,
+      capacidad_m3: estadoDia.capacidad_m3,
+      ocupado_m3: estadoDia.ocupado_m3,
+      libre_m3: estadoDia.libre_m3
+    }),
+    JSON.stringify(estadoDia.mermas),
+    estadoDia.ocupacion_pct
+  ]);
+
+  // Guardar en memoria para /status
+  SIM.ultimoEstado = estadoDia;
 }
 
 // ---------- ENDPOINTS ----------
 app.get('/start', async (req, res) => {
   if (SIM.corriendo) return res.json({ msg: 'Ya está corriendo', ...SIM.ultimoEstado });
   SIM.corriendo = true;
-  SIM.escenario = req.query.escenario === 'cap65' ? 'cap65' : 'cap';
-  SIM.tickMs = Number(req.query.tick || 5000);
+  SIM.escenario = req.query.scenario === 'cap65' ? 'cap65' : 'cap';
+  SIM.tickMs    = Number(req.query.tick || 5000);
   SIM.dia = 0;
 
   const conn = await pool();
   SIM.timer = setInterval(async () => {
     try {
       await simulateDay(conn);
-      console.log(`[Día ${SIM.dia}]`, SIM.ultimoEstado);
+      console.log(`[Día ${SIM.dia}] occ=${SIM.ultimoEstado.ocupacion_pct}%`);
     } catch (e) {
       console.error('Error:', e);
     }
@@ -234,7 +274,47 @@ app.get('/start', async (req, res) => {
   res.json({ ok: true, msg: 'Simulación iniciada', tickMs: SIM.tickMs, escenario: SIM.escenario });
 });
 
-app.get('/status', (req, res) => res.json(SIM.ultimoEstado || { msg: 'Aún no inicia' }));
+app.get('/status', (req, res) => {
+  if (!SIM.ultimoEstado.dia) return res.json({ msg: 'Aún no inicia' });
+  res.json(SIM.ultimoEstado);
+});
+
+// Trae TODOS los días con la MISMA estructura de /status
+app.get('/reportes', async (req, res) => {
+  try {
+    const conn = await pool();
+    const rows = await q(conn, `
+      SELECT day, scenario, inmates_total, inmates_plus, menu_json, purchases_json, waste_json, occupancy_pct
+      FROM daily_report
+      ORDER BY day ASC
+    `);
+
+    const list = rows.map(r => {
+      const menu = typeof r.menu_json === 'string' ? JSON.parse(r.menu_json) : r.menu_json;
+      const comprasPack = typeof r.purchases_json === 'string' ? JSON.parse(r.purchases_json) : r.purchases_json;
+      const mermas = typeof r.waste_json === 'string' ? JSON.parse(r.waste_json) : r.waste_json;
+
+      return {
+        dia: r.day,
+        escenario: r.scenario,
+        reos_total: r.inmates_total,
+        reos_plus: r.inmates_plus,
+        menu,
+        compras: comprasPack?.compras || [],
+        mermas,
+        ocupacion_pct: Number(r.occupancy_pct),
+        capacidad_m3: comprasPack?.capacidad_m3 ?? null,
+        ocupado_m3:   comprasPack?.ocupado_m3   ?? null,
+        libre_m3:     comprasPack?.libre_m3     ?? null
+      };
+    });
+
+    res.json(list);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Error obteniendo reportes' });
+  }
+});
 
 app.get('/stop', (req, res) => {
   if (SIM.timer) clearInterval(SIM.timer);
@@ -242,10 +322,4 @@ app.get('/stop', (req, res) => {
   res.json({ ok: true, msg: 'Simulación detenida' });
 });
 
-app.get('/reportes', async (req, res) => {
-  const conn = await pool();
-  const rows = await q(conn, `SELECT * FROM daily_report ORDER BY day ASC`);
-  res.json(rows);
-});
-
-app.listen(3000, () => console.log('✅ Simulador corriendo en http://localhost:3000'));
+app.listen(3000, () => console.log(' Simulador corriendo en http://localhost:3000'));
